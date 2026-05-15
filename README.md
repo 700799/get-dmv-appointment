@@ -19,8 +19,8 @@ Connect this repo to Vercel and add these environment variables:
 | `CRON_SECRET` | A random secret (e.g. `openssl rand -hex 32`) |
 | `SESSION_SECRET` | Another random secret |
 
-### 2. Create a Vercel KV database
-Dashboard → Storage → Create KV → link to this project. Vercel auto-injects `KV_REST_API_URL` and `KV_REST_API_TOKEN`.
+### 2. Add Upstash Redis storage
+In the Vercel Marketplace, install the **Upstash Redis** integration and link it to this project. Vercel auto-injects `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`.
 
 ### 3. Generate your first password
 ```
