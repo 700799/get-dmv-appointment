@@ -11,16 +11,18 @@ export interface CheckResult {
   officeName: string;
   officeId: number;
   slots: Slot[];
+  /** CAPTCHA_REQUIRED | BLOCKED | RATE_LIMITED | HTTP_xxx | missing_env | string */
   error?: string;
 }
 
 const OFFICES = [
   { id: 631, name: "Pleasanton (Los Positas)" },
-  // Stoneridge ID is a guess — run /api/discover-offices once to confirm
+  // Stoneridge ID is a best-guess — run /api/discover-offices once to confirm
   { id: 640, name: "Pleasanton Stoneridge" },
 ];
 
 const DMV_BASE = "https://www.dmv.ca.gov/wasapp/foa";
+const SCRAPER_API_BASE = "https://api.scraperapi.com";
 
 // ─── Browser fingerprint pool ─────────────────────────────────────────────────
 
@@ -81,21 +83,26 @@ const FINGERPRINTS = [
   },
 ] as const;
 
-function randomFingerprint() {
+type Fingerprint = (typeof FINGERPRINTS)[number];
+
+function randomFingerprint(): Fingerprint {
   return FINGERPRINTS[Math.floor(Math.random() * FINGERPRINTS.length)];
+}
+
+function randomSessionId(): number {
+  return Math.floor(Math.random() * 100_000);
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-/** Random delay in [minMs, maxMs] to mimic human timing. */
 function jitter(minMs: number, maxMs: number): Promise<void> {
   return sleep(Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs);
 }
 
 function buildHeaders(
-  fp: (typeof FINGERPRINTS)[number],
+  fp: Fingerprint,
   referer?: string
 ): Record<string, string> {
   return {
@@ -120,7 +127,7 @@ async function withRetry<T>(
   fn: () => Promise<T>,
   {
     maxAttempts = 3,
-    baseMs = 3000,
+    baseMs = 4_000,
     capMs = 30_000,
   }: { maxAttempts?: number; baseMs?: number; capMs?: number } = {}
 ): Promise<T> {
@@ -131,7 +138,6 @@ async function withRetry<T>(
     } catch (err) {
       lastErr = err;
       if (attempt < maxAttempts - 1) {
-        // Full jitter: pick uniformly from [0, min(cap, base * 2^attempt)]
         const ceiling = Math.min(capMs, baseMs * 2 ** attempt);
         await sleep(Math.random() * ceiling);
       }
@@ -140,40 +146,151 @@ async function withRetry<T>(
   throw lastErr;
 }
 
-// ─── Session acquisition ──────────────────────────────────────────────────────
+// ─── ScraperAPI proxy — routes through US residential IPs ─────────────────────
+//
+// If SCRAPER_API_KEY is not set, falls back to direct fetch (useful for local
+// testing, but will likely get 403'd by the DMV in production).
+
+async function dmvGet(targetUrl: string, sessionId: number): Promise<Response> {
+  const key = process.env.SCRAPER_API_KEY;
+
+  if (!key) {
+    return fetch(targetUrl, {
+      headers: buildHeaders(randomFingerprint()),
+      signal: AbortSignal.timeout(15_000),
+    });
+  }
+
+  const params = new URLSearchParams({
+    api_key: key,
+    url: targetUrl,
+    country_code: "us",
+    session_number: String(sessionId),
+  });
+
+  return fetch(`${SCRAPER_API_BASE}/?${params}`, {
+    signal: AbortSignal.timeout(60_000),
+  });
+}
+
+async function dmvPost(
+  targetUrl: string,
+  formBody: URLSearchParams,
+  sessionId: number,
+  fallbackCookies: string,
+  fp: Fingerprint
+): Promise<Response> {
+  const key = process.env.SCRAPER_API_KEY;
+
+  if (!key) {
+    // Direct fetch fallback (uses manually managed cookies)
+    return fetch(targetUrl, {
+      method: "POST",
+      headers: {
+        ...buildHeaders(fp, `${DMV_BASE}/driveTest.do`),
+        "Content-Type": "application/x-www-form-urlencoded",
+        Cookie: fallbackCookies,
+      },
+      body: formBody.toString(),
+      signal: AbortSignal.timeout(20_000),
+    });
+  }
+
+  // ScraperAPI handles session cookies internally via session_number
+  const scraperBody = new URLSearchParams({
+    api_key: key,
+    url: targetUrl,
+    method: "POST",
+    body: formBody.toString(),
+    country_code: "us",
+    session_number: String(sessionId),
+  });
+
+  return fetch(`${SCRAPER_API_BASE}/`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: scraperBody.toString(),
+    signal: AbortSignal.timeout(60_000),
+  });
+}
+
+// ─── Session management ────────────────────────────────────────────────────────
 
 interface Session {
-  cookies: string;
-  fp: (typeof FINGERPRINTS)[number];
+  sessionId: number;
+  cookies: string; // only relevant for direct-fetch fallback
+  fp: Fingerprint;
 }
 
 async function getSession(): Promise<Session> {
+  const sessionId = randomSessionId();
   const fp = randomFingerprint();
-  const resp = await fetch(`${DMV_BASE}/driveTest.do`, {
-    headers: buildHeaders(fp),
-    signal: AbortSignal.timeout(15_000),
-  });
 
+  // GET the landing page to establish session cookies.
+  // With ScraperAPI: this lets ScraperAPI store the JSESSIONID for the session.
+  // Without ScraperAPI: we extract Set-Cookie manually for the fallback path.
+  const resp = await dmvGet(`${DMV_BASE}/driveTest.do`, sessionId);
   if (!resp.ok) throw new Error(`Session HTTP ${resp.status}`);
 
-  // Prefer getSetCookie() (Node 18+) then fall back to the raw header
-  let cookies: string;
-  if (typeof resp.headers.getSetCookie === "function") {
-    cookies = resp.headers
-      .getSetCookie()
-      .map((c) => c.split(";")[0].trim())
-      .join("; ");
-  } else {
-    cookies = (resp.headers.get("set-cookie") ?? "")
-      .split(",")
-      .map((c) => c.split(";")[0].trim())
-      .join("; ");
+  let cookies = "";
+  if (!process.env.SCRAPER_API_KEY) {
+    if (typeof resp.headers.getSetCookie === "function") {
+      cookies = resp.headers
+        .getSetCookie()
+        .map((c) => c.split(";")[0].trim())
+        .join("; ");
+    } else {
+      cookies = (resp.headers.get("set-cookie") ?? "")
+        .split(",")
+        .map((c) => c.split(";")[0].trim())
+        .join("; ");
+    }
   }
 
-  return { cookies, fp };
+  return { sessionId, cookies, fp };
 }
 
-// ─── HTML parsing (multiple fallback strategies) ─────────────────────────────
+// ─── Personal info (from env vars) ────────────────────────────────────────────
+
+interface PersonalInfo {
+  firstName: string;
+  lastName: string;
+  dlNumber: string;
+  birthMonth: string;
+  birthDay: string;
+  birthYear: string;
+}
+
+function getPersonalInfo(): PersonalInfo | null {
+  const {
+    DMV_FIRST_NAME,
+    DMV_LAST_NAME,
+    DMV_DL_NUMBER,
+    DMV_BIRTH_MONTH,
+    DMV_BIRTH_DAY,
+    DMV_BIRTH_YEAR,
+  } = process.env;
+  if (
+    !DMV_FIRST_NAME ||
+    !DMV_LAST_NAME ||
+    !DMV_DL_NUMBER ||
+    !DMV_BIRTH_MONTH ||
+    !DMV_BIRTH_DAY ||
+    !DMV_BIRTH_YEAR
+  ) {
+    return null;
+  }
+  return {
+    firstName: DMV_FIRST_NAME,
+    lastName: DMV_LAST_NAME,
+    dlNumber: DMV_DL_NUMBER,
+    birthMonth: DMV_BIRTH_MONTH,
+    birthDay: DMV_BIRTH_DAY,
+    birthYear: DMV_BIRTH_YEAR,
+  };
+}
+
+// ─── HTML parser ──────────────────────────────────────────────────────────────
 
 function parseSlots(
   html: string,
@@ -181,47 +298,52 @@ function parseSlots(
   officeId: number
 ): Slot[] {
   const $ = cheerio.load(html);
-  const bodyText = $("body").text();
-  const bodyLower = bodyText.toLowerCase();
-
-  const noAppts =
-    bodyLower.includes("no appointment") ||
-    bodyLower.includes("no available") ||
-    bodyLower.includes("fully booked") ||
-    bodyLower.includes("not available") ||
-    bodyLower.includes("currently no") ||
-    bodyLower.includes("there are no");
-
   const slots: Slot[] = [];
 
   const pushIfDate = (raw: string) => {
-    const dateMatch = raw.match(/([A-Za-z]+ \d{1,2},?\s*\d{4})/);
+    // Matches "Wednesday, May 14, 2026" or "May 14, 2026"
+    const dateMatch = raw.match(
+      /([A-Za-z]+,\s+)?([A-Za-z]+ \d{1,2},?\s*\d{4})/
+    );
     if (!dateMatch) return;
     const timeMatch = raw.match(/(\d{1,2}:\d{2}\s*(?:AM|PM))/i);
+    const noAppts =
+      raw.toLowerCase().includes("no appointment") ||
+      raw.toLowerCase().includes("no available") ||
+      raw.toLowerCase().includes("not available");
+    if (noAppts) return;
     slots.push({
-      date: dateMatch[1].trim(),
+      date: (dateMatch[1] ?? "" + dateMatch[2]).trim(),
       time: timeMatch?.[1] ?? "",
       officeName,
       officeId,
     });
   };
 
-  // Strategy 1: radio inputs labeled with dates
-  $("input[type=radio]").each((_, el) => {
-    const id = $(el).attr("id") ?? "";
-    const val = $(el).attr("value") ?? "";
-    const label = $(`label[for="${id}"]`).text().trim() || val;
-    pushIfDate(label);
+  // Strategy 1: <p class="alert"> — the real CA DMV BTW response
+  // "Wednesday, May 14, 2026 at 2:20 PM" or "There are no appointments available"
+  $("p.alert, .alert, p[class*=alert], div[class*=alert]").each((_, el) => {
+    pushIfDate($(el).text().trim());
   });
 
-  // Strategy 2: table rows / list items
+  // Strategy 2: radio inputs labeled with dates
+  if (slots.length === 0) {
+    $("input[type=radio]").each((_, el) => {
+      const id = $(el).attr("id") ?? "";
+      const val = $(el).attr("value") ?? "";
+      const label = $(`label[for="${id}"]`).text().trim() || val;
+      pushIfDate(label);
+    });
+  }
+
+  // Strategy 3: table rows / list items
   if (slots.length === 0) {
     $("tr, li").each((_, el) => {
       pushIfDate($(el).text().trim());
     });
   }
 
-  // Strategy 3: any element with a recognizable date string
+  // Strategy 4: class-matched elements
   if (slots.length === 0) {
     $("[class*=slot], [class*=appt], [class*=date], [class*=avail]").each(
       (_, el) => {
@@ -230,13 +352,19 @@ function parseSlots(
     );
   }
 
-  // Strategy 4: plain regex over body text as last resort (only if not "no appts")
-  if (slots.length === 0 && !noAppts) {
-    const pattern = /([A-Za-z]+ \d{1,2},?\s*\d{4})/g;
-    for (const m of bodyText.matchAll(pattern)) {
-      const timeMatch = bodyText
-        .slice(m.index ?? 0, (m.index ?? 0) + 40)
-        .match(/(\d{1,2}:\d{2}\s*(?:AM|PM))/i);
+  const bodyLower = $("body").text().toLowerCase();
+  const definitivelyNone =
+    bodyLower.includes("no appointment") ||
+    bodyLower.includes("no available") ||
+    bodyLower.includes("not available") ||
+    bodyLower.includes("there are no");
+
+  // Strategy 5: body text regex — only if page doesn't say "no appointments"
+  if (slots.length === 0 && !definitivelyNone) {
+    const bodyText = $("body").text();
+    for (const m of bodyText.matchAll(/([A-Za-z]+ \d{1,2},?\s*\d{4})/g)) {
+      const after = bodyText.slice(m.index ?? 0, (m.index ?? 0) + 40);
+      const timeMatch = after.match(/(\d{1,2}:\d{2}\s*(?:AM|PM))/i);
       slots.push({
         date: m[1].trim(),
         time: timeMatch?.[1] ?? "",
@@ -255,42 +383,57 @@ export async function checkOffice(
   officeId: number,
   officeName: string
 ): Promise<CheckResult> {
+  const personalInfo = getPersonalInfo();
+  if (!personalInfo) {
+    return {
+      officeName,
+      officeId,
+      slots: [],
+      error:
+        "missing_env: DMV_FIRST_NAME, DMV_LAST_NAME, DMV_DL_NUMBER, DMV_BIRTH_MONTH/DAY/YEAR not set",
+    };
+  }
+
   try {
     return await withRetry(
       async () => {
-        // Human-like pre-request pause
         await jitter(600, 2_500);
 
         const session = await getSession();
 
-        // Pause between landing page and form submit, like a human filling it out
         await jitter(1_000, 3_000);
 
-        const body = new URLSearchParams({
+        const formBody = new URLSearchParams({
+          mode: "DriveTest",
           officeId: String(officeId),
-          taskRationaleCode: "DT",
-          numberItems: "5",
+          firstName: personalInfo.firstName,
+          lastName: personalInfo.lastName,
+          dlNumber: personalInfo.dlNumber,
+          birthMonth: personalInfo.birthMonth,
+          birthDay: personalInfo.birthDay,
+          birthYear: personalInfo.birthYear,
           resetCheckFields: "true",
         });
 
-        const resp = await fetch(`${DMV_BASE}/findOfficeVisit.do`, {
-          method: "POST",
-          headers: {
-            ...buildHeaders(session.fp, `${DMV_BASE}/driveTest.do`),
-            "Content-Type": "application/x-www-form-urlencoded",
-            Cookie: session.cookies,
-          },
-          body: body.toString(),
-          signal: AbortSignal.timeout(20_000),
-        });
+        const resp = await dmvPost(
+          `${DMV_BASE}/findDriveTest.do`,
+          formBody,
+          session.sessionId,
+          session.cookies,
+          session.fp
+        );
 
         if (resp.status === 429) throw new Error("RATE_LIMITED");
+        if (resp.status === 403) throw new Error("BLOCKED");
         if (!resp.ok) throw new Error(`HTTP_${resp.status}`);
 
         const html = await resp.text();
 
-        if (html.toLowerCase().includes("captcha")) {
-          // Don't retry CAPTCHA — return immediately so the outer catch isn't triggered
+        if (
+          html.toLowerCase().includes("recaptcha") ||
+          html.toLowerCase().includes("g-recaptcha")
+        ) {
+          // CAPTCHA is not a transient error — return immediately, don't retry
           return { officeName, officeId, slots: [], error: "CAPTCHA_REQUIRED" };
         }
 
@@ -309,14 +452,12 @@ export async function checkOffice(
   }
 }
 
-/** Check all offices sequentially with a random delay between them to avoid
- *  looking like a bot hammering the DMV from the same session. */
+/** Check all offices sequentially with random gaps to avoid looking like a bot. */
 export async function checkAllOffices(): Promise<CheckResult[]> {
   const results: CheckResult[] = [];
   for (let i = 0; i < OFFICES.length; i++) {
     results.push(await checkOffice(OFFICES[i].id, OFFICES[i].name));
     if (i < OFFICES.length - 1) {
-      // Pause between offices like a user would pause between tasks
       await jitter(2_500, 6_000);
     }
   }
@@ -327,11 +468,8 @@ export async function discoverOfficeIds(): Promise<
   Array<{ id: string; name: string }>
 > {
   await jitter(400, 1_200);
-  const fp = randomFingerprint();
-  const resp = await fetch(`${DMV_BASE}/driveTest.do`, {
-    headers: buildHeaders(fp),
-    signal: AbortSignal.timeout(15_000),
-  });
+  const sessionId = randomSessionId();
+  const resp = await dmvGet(`${DMV_BASE}/driveTest.do`, sessionId);
   const html = await resp.text();
   const $ = cheerio.load(html);
   const offices: Array<{ id: string; name: string }> = [];
