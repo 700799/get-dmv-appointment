@@ -1,0 +1,12 @@
+{
+  "crons": [
+    {
+      "path": "/api/check",
+      "schedule": "*/30 * * * *"
+    },
+    {
+      "path": "/api/rotate-password",
+      "schedule": "0 8 * * 1"
+    }
+  ]
+}
