@@ -1,10 +1,23 @@
 # DMV Appointment Monitor
 
-Checks CA DMV behind-the-wheel test availability at two Pleasanton offices every 10 minutes and emails you the moment a slot opens. Login is protected by a weekly rotating password emailed to you every Monday.
+Checks CA DMV behind-the-wheel test availability and emails you the moment a slot opens. Login is protected by a weekly rotating password emailed to you every Monday.
 
-## Monitored locations
-- Pleasanton — Los Positas (6300 W Las Positas Blvd)
-- Pleasanton — Stoneridge (2621 Stoneridge Mall)
+Everything that used to be hardcoded — **which offices to watch, the days/hours to run, scan timing, and your DMV form details** — is now editable from a password-protected **Admin page** at `/admin`. No redeploys needed to change them.
+
+## Default monitored locations
+- Pleasanton — Las Positas (6300 W Las Positas Blvd)
+- Pleasanton — Stoneridge (2621 Stoneridge Mall Rd)
+
+Add, remove, or disable any CA DMV office from the Admin page — use the built-in "Search DMV" lookup to pull live office IDs straight from the DMV.
+
+## Admin page (`/admin`)
+After logging in, click **⚙️ Admin** to configure:
+- **Schedule** — master on/off, active days, active hours, timezone, and the minimum minutes between scans. Scans only run inside this window.
+- **Scan behavior** — retry attempts, re-notify cooldown, and randomized delays between offices (to look less bot-like).
+- **DMV locations** — add/remove/enable offices; search the live DMV office list by city.
+- **DMV form details** — first/last name, DL or permit number, and date of birth (required by the DMV to return availability). Stored securely in Redis; takes precedence over the `DMV_*` env vars.
+
+The cron fires on a fixed schedule (`vercel.json`), but the app decides whether to actually scan based on your Admin schedule settings — so you control cadence without touching code.
 
 ---
 
@@ -55,11 +68,17 @@ The response JSON includes `hoursSinceLastRealReach` — if it's `0`, the scrape
 ---
 
 ## How it works
-- **Every 10 min**: Vercel cron hits `/api/check` → ScraperAPI routes through a US residential IP → scrapes DMV → emails you if slots appear
+- **On each cron tick** (`vercel.json`): Vercel hits `/api/check`. The app first checks your Admin **schedule** (enabled? active day/hour? past the min-interval?). If the window is open, it scrapes via ScraperAPI (US residential IP) and emails you if slots appear; otherwise it records a "skipped" entry and does nothing.
 - **Every Monday 8 AM UTC**: `/api/rotate-password` → new password → email to you
 - **Blocked alert**: If the DMV hasn't been reachable for 4+ hours, you get an email so you can book manually
 - **CAPTCHA alert**: If reCAPTCHA is detected, you get an email to book manually (once per 12h)
-- The dashboard at `/dashboard` shows live status and polls every 5 minutes
+- The dashboard at `/dashboard` shows live status, the schedule window, monitored offices, and a recent-activity log; it polls every 5 minutes. A **Check now** button forces an immediate scan (bypassing the schedule window).
+
+### Config & state in Redis
+- `dmv:config` — the full editable config (offices, schedule, scan, form details)
+- `dmv:status` — last check result
+- `dmv:runlog` — last 30 runs (shown on the dashboard)
+- `dmv:last_reach`, `dmv:last_notified`, alert dedup keys — heartbeat & notification throttling
 
 ---
 
@@ -71,11 +90,7 @@ The response JSON includes `hoursSinceLastRealReach` — if it's `0`, the scrape
 3. Check Vercel function logs for the `/api/check` route
 
 ### No slots found even when the DMV might have availability
-The Stoneridge office ID (`640`) is a best-guess. After logging in, call:
-```
-GET https://your-app.vercel.app/api/discover-offices
-```
-Compare the returned IDs against `640` and update the `OFFICES` array in `lib/dmv.ts` if needed.
+The Stoneridge office ID (`640`) is a best-guess. Open **/admin → DMV locations → Search DMV**, type a city (e.g. `Pleasanton`), and add the office straight from the live DMV list — the correct numeric ID is filled in for you. Then disable or remove the guessed entry. (Under the hood this calls `GET /api/discover-offices?q=Pleasanton`.)
 
 ### CAPTCHA wall
 ScraperAPI usually handles reCAPTCHA automatically via residential IPs. If CAPTCHA alerts persist for days, consider upgrading to ScraperAPI's premium residential proxy tier.

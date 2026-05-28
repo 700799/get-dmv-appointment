@@ -9,18 +9,44 @@ interface Slot {
   officeName: string;
 }
 
+interface RunLogEntry {
+  at: string;
+  scanned: boolean;
+  skippedReason?: string;
+  available: boolean;
+  slotsFound: number;
+  errors: string[];
+  durationMs: number;
+}
+
 interface Status {
   lastChecked: string | null;
   available: boolean;
   slots: Slot[];
   errors?: string[];
   message?: string;
+  lastReach?: string | null;
+  schedule?: {
+    enabled: boolean;
+    active: boolean;
+    reason: string | null;
+    timezone: string;
+    startHour: number;
+    endHour: number;
+    activeDays: number[];
+    minIntervalMinutes: number;
+  };
+  offices?: Array<{ name: string; address: string | null }>;
+  runLog?: RunLogEntry[];
 }
+
+const DAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
 export default function Dashboard() {
   const [status, setStatus] = useState<Status | null>(null);
   const [loading, setLoading] = useState(true);
   const [testEmailSent, setTestEmailSent] = useState(false);
+  const [checking, setChecking] = useState(false);
   const router = useRouter();
 
   const fetchStatus = useCallback(async () => {
@@ -51,7 +77,17 @@ export default function Dashboard() {
     setTimeout(() => setTestEmailSent(false), 3000);
   }
 
-  function formatTime(iso: string | null) {
+  async function checkNow() {
+    setChecking(true);
+    try {
+      await fetch("/api/check?force=1");
+      await fetchStatus();
+    } finally {
+      setChecking(false);
+    }
+  }
+
+  function formatTime(iso: string | null | undefined) {
     if (!iso) return "Never";
     return new Date(iso).toLocaleString("en-US", {
       month: "short",
@@ -62,6 +98,11 @@ export default function Dashboard() {
     });
   }
 
+  const sched = status?.schedule;
+  const scheduleSummary = sched
+    ? `${sched.activeDays.map((d) => DAY_LABELS[d]).join(", ")} · ${sched.startHour}:00–${sched.endHour}:00 ${sched.timezone.split("/")[1]?.replace("_", " ") ?? sched.timezone} · every ${sched.minIntervalMinutes}m`
+    : null;
+
   return (
     <main style={styles.main}>
       <div style={styles.container}>
@@ -69,26 +110,47 @@ export default function Dashboard() {
         <div style={styles.header}>
           <div>
             <h1 style={styles.title}>🚗 DMV Monitor</h1>
-            <p style={styles.subtitle}>
-              Pleasanton · Behind-the-Wheel Test · Checks every 10 min
-            </p>
+            <p style={styles.subtitle}>Behind-the-Wheel test availability</p>
           </div>
-          <button onClick={logout} style={styles.logoutBtn}>
-            Sign out
-          </button>
+          <div style={{ display: "flex", gap: "0.5rem" }}>
+            <button onClick={() => router.push("/admin")} style={styles.logoutBtn}>
+              ⚙️ Admin
+            </button>
+            <button onClick={logout} style={styles.logoutBtn}>
+              Sign out
+            </button>
+          </div>
         </div>
 
-        {/* Status card */}
         {loading ? (
           <div style={styles.card}>
             <p style={{ color: "#888", textAlign: "center" }}>Loading…</p>
           </div>
-        ) : status?.message ? (
-          <div style={styles.card}>
-            <p style={{ color: "#666", textAlign: "center" }}>{status.message}</p>
-          </div>
         ) : (
           <>
+            {/* Schedule banner */}
+            {sched && (
+              <div
+                style={{
+                  ...styles.scheduleBanner,
+                  background: !sched.enabled
+                    ? "#f1f5f9"
+                    : sched.active
+                      ? "#ecfdf5"
+                      : "#fffbeb",
+                  color: !sched.enabled ? "#475569" : sched.active ? "#065f46" : "#92400e",
+                }}
+              >
+                {!sched.enabled
+                  ? "⏸ Monitoring paused"
+                  : sched.active
+                    ? "🟢 Monitoring active now"
+                    : `🟡 Idle — ${sched.reason}`}
+                {scheduleSummary && <span style={styles.scheduleMeta}>{scheduleSummary}</span>}
+              </div>
+            )}
+
+            {/* Status card */}
             <div
               style={{
                 ...styles.card,
@@ -106,7 +168,7 @@ export default function Dashboard() {
                   {status?.available ? "✓ Slots available!" : "No slots right now"}
                 </span>
                 <span style={styles.lastChecked}>
-                  Last checked: {formatTime(status?.lastChecked ?? null)}
+                  Last checked: {formatTime(status?.lastChecked)}
                 </span>
               </div>
 
@@ -143,20 +205,54 @@ export default function Dashboard() {
               )}
             </div>
 
-            {/* Offices being monitored */}
+            {/* Monitored offices */}
             <div style={styles.card}>
               <h2 style={styles.sectionTitle}>Monitored offices</h2>
               <div style={styles.officeList}>
-                <div style={styles.officeItem}>
-                  <span>📍</span>
-                  <span>Pleasanton — Los Positas (6300 W Las Positas Blvd)</span>
-                </div>
-                <div style={styles.officeItem}>
-                  <span>📍</span>
-                  <span>Pleasanton — Stoneridge (2621 Stoneridge Mall)</span>
-                </div>
+                {(status?.offices ?? []).length === 0 ? (
+                  <p style={{ color: "#888", fontSize: "0.85rem", margin: 0 }}>
+                    No offices enabled.{" "}
+                    <a href="/admin" style={{ color: "#0070f3" }}>
+                      Add some in Admin
+                    </a>
+                    .
+                  </p>
+                ) : (
+                  status?.offices?.map((o, i) => (
+                    <div key={i} style={styles.officeItem}>
+                      <span>📍</span>
+                      <span>
+                        {o.name}
+                        {o.address ? ` (${o.address})` : ""}
+                      </span>
+                    </div>
+                  ))
+                )}
               </div>
             </div>
+
+            {/* Recent activity */}
+            {status?.runLog && status.runLog.length > 0 && (
+              <div style={styles.card}>
+                <h2 style={styles.sectionTitle}>Recent activity</h2>
+                <div style={styles.logList}>
+                  {status.runLog.slice(0, 10).map((r, i) => (
+                    <div key={i} style={styles.logRow}>
+                      <span style={styles.logTime}>{formatTime(r.at)}</span>
+                      <span style={styles.logResult}>
+                        {!r.scanned
+                          ? `skipped (${r.skippedReason ?? "—"})`
+                          : r.errors.length
+                            ? `⚠ ${r.errors.join(", ")}`
+                            : r.available
+                              ? `✓ ${r.slotsFound} slot(s)`
+                              : "no slots"}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </>
         )}
 
@@ -164,6 +260,9 @@ export default function Dashboard() {
         <div style={styles.card}>
           <h2 style={styles.sectionTitle}>Actions</h2>
           <div style={styles.actions}>
+            <button onClick={checkNow} disabled={checking} style={styles.actionBtn}>
+              {checking ? "Checking…" : "Check now"}
+            </button>
             <button onClick={sendTestEmail} style={styles.actionBtn}>
               {testEmailSent ? "✓ Sent!" : "Send test email"}
             </button>
@@ -197,6 +296,18 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: "0.85rem",
     color: "#555",
   },
+  scheduleBanner: {
+    padding: "0.6rem 1rem",
+    borderRadius: "0.5rem",
+    fontSize: "0.85rem",
+    fontWeight: 600,
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    flexWrap: "wrap",
+    gap: "0.5rem",
+  },
+  scheduleMeta: { fontWeight: 400, fontSize: "0.75rem", opacity: 0.85 },
   card: {
     background: "#fff",
     borderRadius: "0.75rem",
@@ -257,6 +368,17 @@ const styles: Record<string, React.CSSProperties> = {
     color: "#555",
     alignItems: "flex-start",
   },
+  logList: { display: "flex", flexDirection: "column", gap: "0.3rem" },
+  logRow: {
+    display: "flex",
+    justifyContent: "space-between",
+    gap: "0.75rem",
+    fontSize: "0.8rem",
+    padding: "0.35rem 0",
+    borderBottom: "1px solid #f1f5f9",
+  },
+  logTime: { color: "#888", whiteSpace: "nowrap" },
+  logResult: { color: "#444", textAlign: "right" },
   actions: { display: "flex", gap: "0.75rem", flexWrap: "wrap" },
   actionBtn: {
     padding: "0.5rem 1rem",

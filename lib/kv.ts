@@ -8,6 +8,16 @@ export interface AppStatus {
   errors?: string[];
 }
 
+export interface RunLogEntry {
+  at: string;
+  scanned: boolean;
+  skippedReason?: string;
+  available: boolean;
+  slotsFound: number;
+  errors: string[];
+  durationMs: number;
+}
+
 const KEYS = {
   STATUS: "dmv:status",
   PASSWORD_HASH: "dmv:password_hash",
@@ -15,7 +25,10 @@ const KEYS = {
   LAST_REACH: "dmv:last_reach",         // last time DMV returned a real page
   BLOCK_ALERT_SENT: "dmv:block_alert",  // dedup key for "been blocked" alert (TTL 20h)
   CAPTCHA_ALERT_SENT: "dmv:captcha_alert", // dedup key for CAPTCHA alert (TTL 12h)
+  RUN_LOG: "dmv:runlog",                // recent run history (capped list)
 } as const;
+
+const RUN_LOG_MAX = 30;
 
 function redis() {
   return new Redis({
@@ -44,9 +57,25 @@ export async function getLastNotified(): Promise<string | null> {
   return redis().get<string>(KEYS.LAST_NOTIFIED);
 }
 
-export async function setLastNotified(timestamp: string): Promise<void> {
-  // Re-notify if slots vanish and reappear after 2 hours
-  await redis().set(KEYS.LAST_NOTIFIED, timestamp, { ex: 7200 });
+export async function setLastNotified(
+  timestamp: string,
+  cooldownSeconds = 7200
+): Promise<void> {
+  // Re-notify only after the cooldown window elapses.
+  await redis().set(KEYS.LAST_NOTIFIED, timestamp, { ex: cooldownSeconds });
+}
+
+// ─── Run history ──────────────────────────────────────────────────────────────
+
+export async function pushRunLog(entry: RunLogEntry): Promise<void> {
+  const r = redis();
+  await r.lpush(KEYS.RUN_LOG, entry);
+  await r.ltrim(KEYS.RUN_LOG, 0, RUN_LOG_MAX - 1);
+}
+
+export async function getRunLog(): Promise<RunLogEntry[]> {
+  const items = await redis().lrange<RunLogEntry>(KEYS.RUN_LOG, 0, RUN_LOG_MAX - 1);
+  return items ?? [];
 }
 
 // ─── Heartbeat / blocked-alert helpers ───────────────────────────────────────

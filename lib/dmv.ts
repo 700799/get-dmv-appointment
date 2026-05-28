@@ -1,4 +1,6 @@
 import * as cheerio from "cheerio";
+import type { Office, PersonalInfo, ScanConfig } from "./config";
+import { DEFAULT_CONFIG } from "./config";
 
 export interface Slot {
   date: string;
@@ -11,15 +13,9 @@ export interface CheckResult {
   officeName: string;
   officeId: number;
   slots: Slot[];
-  /** CAPTCHA_REQUIRED | BLOCKED | RATE_LIMITED | HTTP_xxx | missing_env | string */
+  /** CAPTCHA_REQUIRED | BLOCKED | RATE_LIMITED | HTTP_xxx | missing_info | string */
   error?: string;
 }
-
-const OFFICES = [
-  { id: 631, name: "Pleasanton (Los Positas)" },
-  // Stoneridge ID is a best-guess — run /api/discover-offices once to confirm
-  { id: 640, name: "Pleasanton Stoneridge" },
-];
 
 const DMV_BASE = "https://www.dmv.ca.gov/wasapp/foa";
 const SCRAPER_API_BASE = "https://api.scraperapi.com";
@@ -250,46 +246,6 @@ async function getSession(): Promise<Session> {
   return { sessionId, cookies, fp };
 }
 
-// ─── Personal info (from env vars) ────────────────────────────────────────────
-
-interface PersonalInfo {
-  firstName: string;
-  lastName: string;
-  dlNumber: string;
-  birthMonth: string;
-  birthDay: string;
-  birthYear: string;
-}
-
-function getPersonalInfo(): PersonalInfo | null {
-  const {
-    DMV_FIRST_NAME,
-    DMV_LAST_NAME,
-    DMV_DL_NUMBER,
-    DMV_BIRTH_MONTH,
-    DMV_BIRTH_DAY,
-    DMV_BIRTH_YEAR,
-  } = process.env;
-  if (
-    !DMV_FIRST_NAME ||
-    !DMV_LAST_NAME ||
-    !DMV_DL_NUMBER ||
-    !DMV_BIRTH_MONTH ||
-    !DMV_BIRTH_DAY ||
-    !DMV_BIRTH_YEAR
-  ) {
-    return null;
-  }
-  return {
-    firstName: DMV_FIRST_NAME,
-    lastName: DMV_LAST_NAME,
-    dlNumber: DMV_DL_NUMBER,
-    birthMonth: DMV_BIRTH_MONTH,
-    birthDay: DMV_BIRTH_DAY,
-    birthYear: DMV_BIRTH_YEAR,
-  };
-}
-
 // ─── HTML parser ──────────────────────────────────────────────────────────────
 
 function parseSlots(
@@ -380,19 +336,11 @@ function parseSlots(
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 export async function checkOffice(
-  officeId: number,
-  officeName: string
+  office: Pick<Office, "id" | "name">,
+  personalInfo: PersonalInfo,
+  scan: ScanConfig = DEFAULT_CONFIG.scan
 ): Promise<CheckResult> {
-  const personalInfo = getPersonalInfo();
-  if (!personalInfo) {
-    return {
-      officeName,
-      officeId,
-      slots: [],
-      error:
-        "missing_env: DMV_FIRST_NAME, DMV_LAST_NAME, DMV_DL_NUMBER, DMV_BIRTH_MONTH/DAY/YEAR not set",
-    };
-  }
+  const { id: officeId, name: officeName } = office;
 
   try {
     return await withRetry(
@@ -440,7 +388,7 @@ export async function checkOffice(
         const slots = parseSlots(html, officeName, officeId);
         return { officeName, officeId, slots };
       },
-      { maxAttempts: 3, baseMs: 4_000, capMs: 30_000 }
+      { maxAttempts: scan.maxAttempts, baseMs: 4_000, capMs: 30_000 }
     );
   } catch (err) {
     return {
@@ -452,37 +400,46 @@ export async function checkOffice(
   }
 }
 
-/** Check all offices sequentially with random gaps to avoid looking like a bot. */
-export async function checkAllOffices(): Promise<CheckResult[]> {
+/** Check the given offices sequentially with random gaps to avoid looking like a bot. */
+export async function checkAllOffices(
+  offices: Array<Pick<Office, "id" | "name">>,
+  personalInfo: PersonalInfo,
+  scan: ScanConfig = DEFAULT_CONFIG.scan
+): Promise<CheckResult[]> {
   const results: CheckResult[] = [];
-  for (let i = 0; i < OFFICES.length; i++) {
-    results.push(await checkOffice(OFFICES[i].id, OFFICES[i].name));
-    if (i < OFFICES.length - 1) {
-      await jitter(2_500, 6_000);
+  for (let i = 0; i < offices.length; i++) {
+    results.push(await checkOffice(offices[i], personalInfo, scan));
+    if (i < offices.length - 1) {
+      await jitter(scan.perOfficeDelayMinMs, scan.perOfficeDelayMaxMs);
     }
   }
   return results;
 }
 
-export async function discoverOfficeIds(): Promise<
-  Array<{ id: string; name: string }>
-> {
+/**
+ * Fetch the live list of CA DMV behind-the-wheel offices from the FOA dropdown.
+ * Pass a filter substring to narrow the results (case-insensitive).
+ */
+export async function discoverOffices(
+  filter?: string
+): Promise<Array<{ id: string; name: string }>> {
   await jitter(400, 1_200);
   const sessionId = randomSessionId();
   const resp = await dmvGet(`${DMV_BASE}/driveTest.do`, sessionId);
   const html = await resp.text();
   const $ = cheerio.load(html);
   const offices: Array<{ id: string; name: string }> = [];
+  const needle = filter?.trim().toLowerCase();
 
-  $(
-    "select[name=officeId] option, select[name=branchCode] option"
-  ).each((_, el) => {
-    const id = $(el).attr("value") ?? "";
-    const name = $(el).text().trim();
-    if (id && name && name.toLowerCase().includes("pleasanton")) {
+  $("select[name=officeId] option, select[name=branchCode] option").each(
+    (_, el) => {
+      const id = $(el).attr("value") ?? "";
+      const name = $(el).text().trim();
+      if (!id || !name || id === "0") return;
+      if (needle && !name.toLowerCase().includes(needle)) return;
       offices.push({ id, name });
     }
-  });
+  );
 
   return offices;
 }
