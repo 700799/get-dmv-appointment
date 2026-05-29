@@ -51,25 +51,43 @@ In the Vercel dashboard → **Storage** tab (or [Vercel Marketplace](https://ver
 
 Redeploy after linking so the new env vars are picked up.
 
-### 4. Generate your first login password
+### 4. Add GitHub Actions secrets (required for reliable 30-min checks)
+
+Vercel Hobby crons only run once per day. GitHub Actions is the reliable alternative — a workflow is already in `.github/workflows/dmv-monitor.yml`.
+
+In your GitHub repo → **Settings → Secrets → Actions**, add:
+
+| Secret | Value |
+|--------|-------|
+| `APP_URL` | Your deployed Vercel URL, e.g. `https://your-app.vercel.app` |
+| `CRON_SECRET` | Same value you set in Vercel |
+
+The workflow runs every 30 minutes and rotates the password every Monday 8 AM UTC. You can also trigger it manually from the **Actions** tab.
+
+### 5. Generate your first login password
 ```bash
-curl -X POST https://your-app.vercel.app/api/rotate-password \
+curl -X POST https://your-app.vercel.app/api/setup \
   -H "Authorization: Bearer YOUR_CRON_SECRET"
 ```
+This is a one-time call — it creates a password and emails it to you. After that, `/api/setup` is a no-op (use `/api/rotate-password` to force rotation).
+
 Check your email for the password, then log in at your Vercel URL.
 
-### 5. Trigger a manual check to verify everything works
+### 6. Trigger a manual check to verify everything works
 ```bash
 curl -X POST https://your-app.vercel.app/api/check \
   -H "Authorization: Bearer YOUR_CRON_SECRET"
 ```
 The response JSON includes `hoursSinceLastRealReach` — if it's `0`, the scraper reached the DMV successfully. If it stays high after multiple checks, see Troubleshooting below.
 
+You can also click **Check now** on the dashboard to trigger a scan from the browser.
+
 ---
 
 ## How it works
-- **On each cron tick** (`vercel.json`): Vercel hits `/api/check`. The app first checks your Admin **schedule** (enabled? active day/hour? past the min-interval?). If the window is open, it scrapes via ScraperAPI (US residential IP) and emails you if slots appear; otherwise it records a "skipped" entry and does nothing.
-- **Every Monday 8 AM UTC**: `/api/rotate-password` → new password → email to you
+- **Every 30 min** (GitHub Actions, primary): workflow hits `POST /api/check`. The app gates on your Admin **schedule** (enabled? active day/hour? past the min-interval?). If the window is open, it scrapes via ScraperAPI (US residential IP) and emails you if slots appear; otherwise records a "skipped" entry and exits immediately.
+- **`vercel.json` cron** (fallback): also hits `/api/check`; the min-interval gate ensures no double-scans regardless of how many callers fire.
+- **Every Monday 8 AM UTC**: GitHub Actions hits `/api/rotate-password` → new password → email to you
 - **Blocked alert**: If the DMV hasn't been reachable for 4+ hours, you get an email so you can book manually
 - **CAPTCHA alert**: If reCAPTCHA is detected, you get an email to book manually (once per 12h)
 - The dashboard at `/dashboard` shows live status, the schedule window, monitored offices, and a recent-activity log; it polls every 5 minutes. A **Check now** button forces an immediate scan (bypassing the schedule window).

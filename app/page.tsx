@@ -24,7 +24,12 @@ export default function LoginPage() {
       router.push("/dashboard");
     } else {
       const data = await res.json();
-      setError(data.error ?? "Login failed");
+      const raw = data.error ?? "Login failed";
+      setError(
+        raw.includes("No password configured")
+          ? "No password set yet. Run the setup step (see README) to generate your first password."
+          : raw
+      );
       setLoading(false);
     }
   }
